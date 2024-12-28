@@ -3,3 +3,7 @@
 *.csv
 *.gz
 *.pptx
+*.tsv
+.DS_Store
+/Dados
+Dados/GSE221042_RAW/.DS_Store

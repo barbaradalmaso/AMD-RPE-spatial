@@ -16,6 +16,7 @@ from scipy.sparse import csr_matrix
 import anndata as ad
 from sklearn.decomposition import PCA
 from scipy.stats import pearsonr
+import scanpy.external as sce
 
 
 # In[0.2]: Ajustar work-directory
@@ -48,7 +49,7 @@ gene_list_human = [gene.upper() for gene in gene_list]  # Converter genes de cam
 # Decidi exportar separadamente cada grupo da pesquisa, para conseguir fazer as análises exploratórias separadamente
 
 # Caminho para os dados
-path = "/Users/barbaradalmaso/Desktop/AMD-RPE-spatial/Dados/GSE221042_RAW/"
+path = "/Users/barbaradalmaso/Desktop/AMD-RPE-spatial/Dados/GSE221042_RAW/" # https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE221042
 
 def process_files(metadata_path, gene_list, output_path):
     # Ler metadados
@@ -60,19 +61,29 @@ def process_files(metadata_path, gene_list, output_path):
     # Inicializar AnnData
     all_data = []
     
-    for barcodes_file, features_file, matrix_file in zip(metadatasc['barcodes'], metadatasc['features'], metadatasc['matrix']):
+    for i, (barcodes_file, features_file, matrix_file) in enumerate(zip(metadatasc['barcodes'], metadatasc['features'], metadatasc['matrix'])):
         # Ler os dados
         barcodes = pd.read_csv(f"{path}{barcodes_file}", header=None, sep="\t")[0].values
         features = pd.read_csv(f"{path}{features_file}", header=None, sep="\t")[1].values
         matrix = mmread(f"{path}{matrix_file}").tocsr()
+        
+        # Remover genes duplicados
+        unique_features, indices = np.unique(features, return_index=True)
+        features = unique_features
+        matrix = matrix[indices, :]
         
         # Filtrar genes de interesse
         valid_genes = np.intersect1d(features, gene_list)
         gene_indices = np.where(np.isin(features, valid_genes))[0]
         filtered_matrix = matrix[gene_indices, :]
         
+        # Criar obs com matrix e age
+        obs = pd.DataFrame(index=barcodes)
+        obs['matrix'] = metadatasc.iloc[i]['matrix']  # Adicionar a informação de matrix
+        obs['age'] = metadatasc.iloc[i]['age']        # Adicionar a informação de age
+        
         # Criar AnnData
-        adata = sc.AnnData(X=filtered_matrix.T, var=pd.DataFrame(index=valid_genes), obs=pd.DataFrame(index=barcodes))
+        adata = sc.AnnData(X=filtered_matrix.T, var=pd.DataFrame(index=valid_genes), obs=obs)
         all_data.append(adata)
     
     # Concatenar todos os dados
@@ -91,6 +102,15 @@ process_files(f"{path}metadata-sc-dry-amd.csv", gene_list_human, f"{path}dry_amd
 wet = sc.read_h5ad("/Users/barbaradalmaso/Desktop/AMD-RPE-spatial/Dados/GSE221042_RAW/wet_amd.h5ad") 
 dry = sc.read_h5ad("/Users/barbaradalmaso/Desktop/AMD-RPE-spatial/Dados/GSE221042_RAW/dry_amd.h5ad") 
 control = sc.read_h5ad("/Users/barbaradalmaso/Desktop/AMD-RPE-spatial/Dados/GSE221042_RAW/control.h5ad") 
+
+# Transformar matrix em fator
+wet = wet.obs['matrix'].astype('category')
+dry = dry.obs['matrix'].astype('category')
+control = control.obs['matrix'].astype('category')
+
+wet.obs['patient_code'] = wet.obs['matrix']
+dry.obs['patient_code'] = dry.obs['matrix']
+control.obs['patient_code'] = control.obs['matrix']
 
 # Primeiro, como observei que a maior parte das celulas possuem baixo count de genes, decidi filtrar 
 # as celulas com total count abaixo de 500 (em cada amostra)
@@ -125,83 +145,65 @@ combined_data = ad.concat([control_filtered, dry_filtered, wet_filtered], label=
 output_path = "/Users/barbaradalmaso/Desktop/AMD-RPE-spatial/Dados/combined_patient_sc.h5ad"
 combined_data.write(output_path)
 
-# Nessa etapa irei finalmente fazer as analises exploratorias. Irei mostrar os dados de pacientes tanto separados, quanto juntos
-####### Teste de normalidade #########
-# Criar histogramas para os dados filtrados individuais e o combinado
-sns.set_context("talk", font_scale=1.2)  # Aumenta o tamanho das fontes
-sns.set_style("whitegrid")  # Adiciona grid para melhor visualização
+# Ajustar tons de amarelo para maior contraste
+control_colors = ['#CDCCFB', '#ADADF9', '#6E6EE3', '#6868F6', '#5353F6', '#2727CB']
+dry_amd_colors = ['#FFEE99', '#FFDD66', '#FFCC33', '#FFBB00']  
+wet_amd_colors = ['#F7CECE', '#F2A7A5', '#DE645F', '#EC605A', '#E35C57', '#E14D45', '#EB4940']
 
-# Criar histogramas para os dados filtrados individuais e o combinado
-fig, axes = plt.subplots(1, 4, figsize=(24, 6), sharey=True)
+# Criar dicionário de cores por grupo
+group_colors = {
+    'Control': control_colors,
+    'Dry AMD': dry_amd_colors,
+    'Wet AMD': wet_amd_colors
+}
 
-# Histograma do grupo control
-sns.histplot(control_filtered.obs['total_counts'], bins=50, kde=False, ax=axes[0], color='blue', linewidth=2)
-axes[0].set_title('Control', fontsize=20, weight='bold')
-axes[0].set_xlabel('Total Counts', fontsize=20)
-axes[0].set_ylabel('Frequency', fontsize=20)
+# Função para criar gráfico de PCA
+def plot_combined_pca(ax, combined_pca, combined_var, combined_data, group_colors):
+    if 'group' not in combined_data.obs:
+        raise KeyError("A coluna 'group' não foi encontrada no objeto 'combined_data.obs'. Verifique os dados.")
+    combined_data.obs['group'] = combined_data.obs['group'].str.strip().str.capitalize()
 
-# Histograma do grupo dry_amd
-sns.histplot(dry_filtered.obs['total_counts'], bins=50, kde=False, ax=axes[1], color='orange', linewidth=2)
-axes[1].set_title('Dry AMD', fontsize=20, weight='bold')
-axes[1].set_xlabel('Total Counts', fontsize=20)
-axes[1].set_ylabel('')
+    for group in combined_data.obs['group'].unique():
+        if group not in group_colors:
+            print(f"Aviso: O grupo '{group}' não está no dicionário de cores e será ignorado.")
+            continue
 
-# Histograma do grupo wet_amd
-sns.histplot(wet_filtered.obs['total_counts'], bins=50, kde=False, ax=axes[2], color='green', linewidth=2)
-axes[2].set_title('Wet AMD', fontsize=20, weight='bold')
-axes[2].set_xlabel('Total Counts', fontsize=20)
-axes[2].set_ylabel('')
+        idx_group = combined_data.obs['group'] == group
+        color_set = group_colors[group]
+        color_idx = 0
 
-# Histograma dos dados combinados
-sns.histplot(combined_data.obs['total_counts'], bins=50, kde=False, ax=axes[3], color='purple', linewidth=2)
-axes[3].set_title('Combined samples', fontsize=20, weight='bold')
-axes[3].set_xlabel('Total Counts', fontsize=20)
-axes[3].set_ylabel('')
+        for patient in combined_data.obs.loc[idx_group, 'patient_code'].unique():
+            idx_patient = (combined_data.obs['group'] == group) & (combined_data.obs['patient_code'] == patient)
+            ax.scatter(
+                combined_pca[idx_patient, 0],
+                combined_pca[idx_patient, 1],
+                alpha=0.2,
+                color=color_set[color_idx % len(color_set)],  # Alternar cores
+                label=f"{group} - {patient}",
+                edgecolor='none',
+                s=50
+            )
+            color_idx += 1
 
-# Ajustar layout
-plt.tight_layout()
-plt.show()
-
-####### Teste PCA #########
-# Função para realizar PCA
-def perform_pca(data, n_components=2):
-    pca = PCA(n_components=n_components)
-    pca_result = pca.fit_transform(data.X.toarray() if isinstance(data.X, csr_matrix) else data.X)
-    explained_variance = pca.explained_variance_ratio_
-    return pca_result, explained_variance
-
-# PCA para os conjuntos de dados filtrados
-control_pca, control_var = perform_pca(control_filtered)
-dry_pca, dry_var = perform_pca(dry_filtered)
-wet_pca, wet_var = perform_pca(wet_filtered)
-combined_pca, combined_var = perform_pca(combined_data)
+    ax.set_title(f'Combined samples\nPC1: {combined_var[0]*100:.2f}%, PC2: {combined_var[1]*100:.2f}%', fontsize=16)
+    ax.set_xlabel('PC1', fontsize=20)
+    ax.set_ylabel('PC2', fontsize=20)
+    ax.legend(title='Group - Patient Code', fontsize=10)
 
 # Criar gráficos de PCA
 fig, axes = plt.subplots(1, 4, figsize=(24, 6))
 
 # Control
-axes[0].scatter(control_pca[:, 0], control_pca[:, 1], alpha=0.5, color='blue')
-axes[0].set_title(f'Control\nPC1: {control_var[0]*100:.2f}%, PC2: {control_var[1]*100:.2f}%', fontsize=16)
-axes[0].set_xlabel('PC1', fontsize=20)
-axes[0].set_ylabel('PC2', fontsize=20)
+plot_pca(control_pca, control_var, 'Control', axes[0], control_colors, control_filtered)
 
 # Dry AMD
-axes[1].scatter(dry_pca[:, 0], dry_pca[:, 1], alpha=0.5, color='orange')
-axes[1].set_title(f'Dry AMD\nPC1: {dry_var[0]*100:.2f}%, PC2: {dry_var[1]*100:.2f}%', fontsize=16)
-axes[1].set_xlabel('PC1', fontsize=20)
-axes[1].set_ylabel('PC2', fontsize=20)
+plot_pca(dry_pca, dry_var, 'Dry AMD', axes[1], dry_amd_colors, dry_filtered)
 
 # Wet AMD
-axes[2].scatter(wet_pca[:, 0], wet_pca[:, 1], alpha=0.5, color='green')
-axes[2].set_title(f'Wet AMD\nPC1: {wet_var[0]*100:.2f}%, PC2: {wet_var[1]*100:.2f}%', fontsize=16)
-axes[2].set_xlabel('PC1', fontsize=20)
-axes[2].set_ylabel('PC2', fontsize=20)
+plot_pca(wet_pca, wet_var, 'Wet AMD', axes[2], wet_amd_colors, wet_filtered)
 
 # Combined
-axes[3].scatter(combined_pca[:, 0], combined_pca[:, 1], alpha=0.5, color='purple')
-axes[3].set_title(f'Combined samples\nPC1: {combined_var[0]*100:.2f}%, PC2: {combined_var[1]*100:.2f}%', fontsize=16)
-axes[3].set_xlabel('PC1', fontsize=20)
-axes[3].set_ylabel('PC2', fontsize=20)
+plot_combined_pca(axes[3], combined_pca, combined_var, combined_data, group_colors)
 
 # Ajustar layout
 plt.tight_layout()
@@ -341,3 +343,36 @@ sc.pl.tsne(combined_adata, color='dataset', title='t-SNE Geral - Datasets')
 
 # 7. Plotar PCA
 sc.pl.pca(combined_adata, color='dataset', title='PCA Geral - Datasets')
+
+
+# In[2.2]: Como os dados são muito diferentes entre si, vou fazer integração multiomica
+# Datasets
+sdata = sc.read_h5ad("/Users/barbaradalmaso/Desktop/AMD-RPE-spatial/Dados/filtered_spatialdata.h5ad")  # Arquivo de dados espaciais
+bulkdata = sc.read_h5ad("/Users/barbaradalmaso/Desktop/AMD-RPE-spatial/Dados/combined_patient_sc.h5ad") # Arquivo de dados scRNA-seq
+
+# Concatenar os dois datasets
+combined_data = ad.concat([sdata, bulkdata], join='inner', label='dataset', keys=['sdata', 'bulkdata'])
+
+# Adicione uma coluna para batch
+combined_data.obs['batch'] = combined_data.obs['dataset']
+
+# Correção com Harmony
+sc.pp.pca(combined_data, n_comps=10)
+sce.pp.harmony_integrate(combined_data, 'batch')
+sc.pp.neighbors(combined_data, n_neighbors=30, n_pcs=10)  # Aumentar n_neighbors
+sc.tl.umap(combined_data)
+
+# Visualizar integração
+sc.tl.leiden(combined_data, resolution=0.1)  # Diminua a resolução (p.ex.: 0.2)
+sc.pl.umap(combined_data, color=['dataset', 'batch', 'leiden'])  # Visualizar os clusters
+
+
+
+
+
+
+
+
+
+
+
